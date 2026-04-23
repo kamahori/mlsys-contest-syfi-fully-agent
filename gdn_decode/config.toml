@@ -1,0 +1,11 @@
+[solution]
+name = "syfi-gdn-decode-v1"
+definition = "gdn_decode_qk4_v8_d128_k_last"
+author = "syfi"
+
+[build]
+language = "cuda"
+entry_point = "gdn_decode.cu::run_decode"
+target_hardware = ["cuda"]
+destination_passing_style = true
+binding = "tvm-ffi"

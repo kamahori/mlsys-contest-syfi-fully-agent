@@ -1,0 +1,11 @@
+[solution]
+name = "syfi-gdn-prefill-v1"
+definition = "gdn_prefill_qk4_v8_d128_k_last"
+author = "syfi"
+
+[build]
+language = "cuda"
+entry_point = "gdn_prefill.cu::run_prefill"
+target_hardware = ["cuda"]
+destination_passing_style = true
+binding = "tvm-ffi"
