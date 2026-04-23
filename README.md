@@ -10,6 +10,9 @@ Each subdirectory is a self-contained submission for one kernel definition, foll
 
 ```
 syfi-full-agent/
+├── moe/
+│   ├── config.toml           # definition = "moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048"
+│   └── solution/cuda/moe.cu
 ├── gdn_prefill/
 │   ├── config.toml           # definition = "gdn_prefill_qk4_v8_d128_k_last"
 │   └── solution/cuda/gdn_prefill.cu

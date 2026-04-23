@@ -1,0 +1,11 @@
+[solution]
+name = "syfi-moe-v1"
+definition = "moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048"
+author = "syfi"
+
+[build]
+language = "cuda"
+entry_point = "moe.cu::run_moe"
+target_hardware = ["cuda"]
+destination_passing_style = true
+binding = "tvm-ffi"
