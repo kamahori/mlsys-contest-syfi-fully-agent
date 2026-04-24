@@ -1,0 +1,29 @@
+# Bundled contest dataset — download separately, do not commit
+mlsys26-contest/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# uv / virtualenv
+.venv/
+.uv_cache/
+
+# Pipeline run artifacts
+runs/
+
+# MCP / skill tooling caches
+mcps/ncu-mcp/.venv/
+mcps/ncu-mcp/__pycache__/
+
+# Claude CLI session artifacts (if any land locally)
+.claude/sessions/
+.claude/state/
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp

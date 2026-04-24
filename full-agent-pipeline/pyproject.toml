@@ -1,0 +1,25 @@
+[project]
+name = "full-agent-pipeline"
+version = "0.0.1"
+description = "Autonomous Triton/CUDA kernel pipeline over flashinfer-bench."
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "flashinfer-bench",
+    "modal",
+    # NVIDIA driver here is CUDA 12.8; pin to a cu128 wheel.
+    "torch>=2.7,<2.11",
+    "triton",
+    "numpy",
+    "tomli; python_version < '3.11'",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu128" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true

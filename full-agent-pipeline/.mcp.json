@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "ncu-mcp": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "--directory",
+        "./mcps/ncu-mcp",
+        "run",
+        "ncu-mcp-server"
+      ]
+    }
+  }
+}

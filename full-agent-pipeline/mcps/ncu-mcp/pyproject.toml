@@ -1,0 +1,16 @@
+[project]
+name = "ncu-mcp"
+version = "0.1.0"
+description = "MCP server wrapping NVIDIA Nsight Compute for GPU kernel profiling"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp[cli]>=1.26.0",
+]
+
+[project.scripts]
+ncu-mcp-server = "ncu_mcp.server:main"
+ncu-mcp-test = "ncu_mcp.test_client:run"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
