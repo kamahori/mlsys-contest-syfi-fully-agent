@@ -19,12 +19,14 @@
  * If any step fails, we fall back to a correct host-side reference
  * (slow but verified — that was the round-3 implementation).
  *
- * Kernel design (V_TILE=8, 1 warp, K-warp-reduce — proven layout):
+ * Kernel design (V_TILE=8, 1 warp, K-warp-reduce):
  *   Grid:  (B * Hv * V/V_TILE) = (B * 8 * 16)
  *   Block: 32 threads = 1 warp. Each warp owns 8 v-rows; each thread holds
  *          K_LOCAL = K/32 = 4 K-slots. State[8][4]=32 fp32 in registers.
  *   K-reductions are warp-shfl. State reads are float4-vectorized; new_state
  *   writes are float4-vectorized; output writes are scalar bf16.
+ *   Output is derived from qS(old), kS(old), and qk_dot to avoid a second
+ *   dot product over the updated state.
  */
 
 #include <dlfcn.h>
@@ -82,6 +84,7 @@ static DrvAPI       g_drv   = {};
 static NvrtcAPI     g_nvrtc = {};
 static CUmodule     g_module = nullptr;
 static CUfunction   g_kernel = nullptr;
+static CUfunction   g_kernel_small = nullptr;
 static pthread_once_t g_init_once = PTHREAD_ONCE_INIT;
 static bool         g_gpu_ok = false;
 
@@ -137,6 +140,36 @@ void gdn_decode_kernel(
   const int k_lo    = lane * K_LOCAL;
   const int v_warp  = v_base + warp_id * V_PER_WARP;
 
+  // ---- issue independent loads before gate SFU work --------------------
+  const float* s_bh = state_ptr + (b_idx * Hv + h_idx) * V_DIM * K_DIM;
+  float S[V_PER_WARP][K_LOCAL];
+  #pragma unroll
+  for (int jt = 0; jt < V_PER_WARP; ++jt) {
+    const int row_off = (v_warp + jt) * K_DIM + k_lo;
+    const float4 v4 = __ldg(reinterpret_cast<const float4*>(s_bh + row_off));
+    S[jt][0] = v4.x; S[jt][1] = v4.y; S[jt][2] = v4.z; S[jt][3] = v4.w;
+  }
+
+  const int qk_base = b_idx * Hq * K_DIM + qh * K_DIM + k_lo;
+  float q_arr[K_LOCAL], k_arr[K_LOCAL];
+  const uint2 q_u2 = *reinterpret_cast<const uint2*>(q_ptr + qk_base);
+  const uint2 k_u2 = *reinterpret_cast<const uint2*>(k_ptr + qk_base);
+  const __nv_bfloat162* q_b2 = reinterpret_cast<const __nv_bfloat162*>(&q_u2);
+  const __nv_bfloat162* k_b2 = reinterpret_cast<const __nv_bfloat162*>(&k_u2);
+  q_arr[0] = __bfloat162float(q_b2[0].x);
+  q_arr[1] = __bfloat162float(q_b2[0].y);
+  q_arr[2] = __bfloat162float(q_b2[1].x);
+  q_arr[3] = __bfloat162float(q_b2[1].y);
+  k_arr[0] = __bfloat162float(k_b2[0].x);
+  k_arr[1] = __bfloat162float(k_b2[0].y);
+  k_arr[2] = __bfloat162float(k_b2[1].x);
+  k_arr[3] = __bfloat162float(k_b2[1].y);
+
+  float v_mine = 0.f;
+  if (lane < V_PER_WARP) {
+    v_mine = __bfloat162float(v_ptr[b_idx * Hv * V_DIM + h_idx * V_DIM + v_warp + lane]);
+  }
+
   // ---- gates ------------------------------------------------------------
   const float A_log    = A_log_ptr[h_idx];
   const float dt_bias  = dt_bias_ptr[h_idx];
@@ -147,7 +180,82 @@ void gdn_decode_kernel(
   const float g        = expf(-expf(A_log) * softplus);
   const float beta     = 1.f / (1.f + expf(-b_val));
 
-  // ---- q, k -------------------------------------------------------------
+  float lqk = 0.f;
+  #pragma unroll
+  for (int s = 0; s < K_LOCAL; ++s) lqk += q_arr[s] * k_arr[s];
+  const float qk_dot = warp_reduce_sum(lqk);
+
+  // ---- kS[jt] and qS[jt] from old state ---------------------------------
+  float kS[V_PER_WARP], qS[V_PER_WARP];
+  #pragma unroll
+  for (int jt = 0; jt < V_PER_WARP; ++jt) {
+    float lk = 0.f, lq = 0.f;
+    #pragma unroll
+    for (int s = 0; s < K_LOCAL; ++s) {
+      lk += k_arr[s] * S[jt][s];
+      lq += q_arr[s] * S[jt][s];
+    }
+    kS[jt] = warp_reduce_sum(lk);
+    qS[jt] = warp_reduce_sum(lq);
+  }
+
+  // ---- write new_state (float4) and scalar outputs ---------------------
+  float* ns_bh = new_state + (b_idx * Hv + h_idx) * V_DIM * K_DIM;
+  #pragma unroll
+  for (int jt = 0; jt < V_PER_WARP; ++jt) {
+    const float v_jt  = __shfl_sync(0xffffffff, v_mine, jt);
+    const float delta = beta * (v_jt - g * kS[jt]);
+    float4 nv;
+    nv.x = g * S[jt][0] + delta * k_arr[0];
+    nv.y = g * S[jt][1] + delta * k_arr[1];
+    nv.z = g * S[jt][2] + delta * k_arr[2];
+    nv.w = g * S[jt][3] + delta * k_arr[3];
+    *reinterpret_cast<float4*>(ns_bh + (v_warp + jt) * K_DIM + k_lo) = nv;
+
+    if (lane == jt) {
+      const float o = scale * (g * qS[jt] + delta * qk_dot);
+      out_ptr[b_idx * Hv * V_DIM + h_idx * V_DIM + v_warp + jt] = __float2bfloat16(o);
+    }
+  }
+}
+
+extern "C" __global__ __launch_bounds__(64, 12)
+void gdn_decode_kernel_small(
+    const __nv_bfloat16* __restrict__ q_ptr,
+    const __nv_bfloat16* __restrict__ k_ptr,
+    const __nv_bfloat16* __restrict__ v_ptr,
+    const float*         __restrict__ state_ptr,
+    const float*         __restrict__ A_log_ptr,
+    const __nv_bfloat16* __restrict__ a_ptr,
+    const float*         __restrict__ dt_bias_ptr,
+    const __nv_bfloat16* __restrict__ b_ptr,
+    __nv_bfloat16*       __restrict__ out_ptr,
+    float*               __restrict__ new_state,
+    float scale)
+{
+  const int pid         = blockIdx.x;
+  const int bh          = pid / 64;
+  const int v_tile_idx  = pid - bh * 64;
+  const int b_idx       = bh / Hv;
+  const int h_idx       = bh - b_idx * Hv;
+  const int qh          = h_idx >> 1;
+  const int v_base      = v_tile_idx * 2;
+
+  const int tid     = threadIdx.x;
+  const int warp_id = tid >> 5;
+  const int lane    = tid & 31;
+  const int k_lo    = lane * K_LOCAL;
+  const int v_warp  = v_base + warp_id;
+
+  const float A_log    = A_log_ptr[h_idx];
+  const float dt_bias  = dt_bias_ptr[h_idx];
+  const float a_val    = __bfloat162float(a_ptr[b_idx * Hv + h_idx]);
+  const float b_val    = __bfloat162float(b_ptr[b_idx * Hv + h_idx]);
+  const float x        = a_val + dt_bias;
+  const float softplus = (x > 20.f) ? x : log1pf(expf(x));
+  const float g        = expf(-expf(A_log) * softplus);
+  const float beta     = 1.f / (1.f + expf(-b_val));
+
   const int qk_base = b_idx * Hq * K_DIM + qh * K_DIM + k_lo;
   float q_arr[K_LOCAL], k_arr[K_LOCAL];
   #pragma unroll
@@ -156,55 +264,51 @@ void gdn_decode_kernel(
     k_arr[i] = __bfloat162float(k_ptr[qk_base + i]);
   }
 
-  // ---- v slab -----------------------------------------------------------
   float v_mine = 0.f;
-  if (lane < V_PER_WARP) {
+  if (lane == 0) {
     v_mine = __bfloat162float(v_ptr[b_idx * Hv * V_DIM + h_idx * V_DIM + v_warp + lane]);
   }
 
-  // ---- state slab into registers ---------------------------------------
   const float* s_bh = state_ptr + (b_idx * Hv + h_idx) * V_DIM * K_DIM;
-  float S[V_PER_WARP][K_LOCAL];
+  float S[1][K_LOCAL];
   #pragma unroll
-  for (int jt = 0; jt < V_PER_WARP; ++jt) {
+  for (int jt = 0; jt < 1; ++jt) {
     const int row_off = (v_warp + jt) * K_DIM + k_lo;
     const float4 v4 = *reinterpret_cast<const float4*>(s_bh + row_off);
     S[jt][0] = v4.x; S[jt][1] = v4.y; S[jt][2] = v4.z; S[jt][3] = v4.w;
   }
 
-  // ---- kS[jt] = sum_k k[k] * S[jt,k] -----------------------------------
-  float kS[V_PER_WARP];
+  float kS[1], qS[1];
   #pragma unroll
-  for (int jt = 0; jt < V_PER_WARP; ++jt) {
-    float local = 0.f;
+  for (int jt = 0; jt < 1; ++jt) {
+    float lk = 0.f, lq = 0.f;
     #pragma unroll
-    for (int s = 0; s < K_LOCAL; ++s) local += k_arr[s] * S[jt][s];
-    kS[jt] = warp_reduce_sum(local);
+    for (int s = 0; s < K_LOCAL; ++s) {
+      lk += k_arr[s] * S[jt][s];
+      lq += q_arr[s] * S[jt][s];
+    }
+    kS[jt] = warp_reduce_sum(lk);
+    qS[jt] = warp_reduce_sum(lq);
   }
+  float lqk = 0.f;
+  #pragma unroll
+  for (int s = 0; s < K_LOCAL; ++s) lqk += q_arr[s] * k_arr[s];
+  const float qk_dot = warp_reduce_sum(lqk);
 
-  // ---- update S -> S_new in regs + write new_state (float4) ------------
   float* ns_bh = new_state + (b_idx * Hv + h_idx) * V_DIM * K_DIM;
   #pragma unroll
-  for (int jt = 0; jt < V_PER_WARP; ++jt) {
-    const float v_jt = __shfl_sync(0xffffffff, v_mine, jt);
-    const float r    = v_jt - g * kS[jt];
+  for (int jt = 0; jt < 1; ++jt) {
+    const float v_jt  = __shfl_sync(0xffffffff, v_mine, jt);
+    const float delta = beta * (v_jt - g * kS[jt]);
     float4 nv;
-    nv.x = g * S[jt][0] + beta * k_arr[0] * r;
-    nv.y = g * S[jt][1] + beta * k_arr[1] * r;
-    nv.z = g * S[jt][2] + beta * k_arr[2] * r;
-    nv.w = g * S[jt][3] + beta * k_arr[3] * r;
-    S[jt][0] = nv.x; S[jt][1] = nv.y; S[jt][2] = nv.z; S[jt][3] = nv.w;
+    nv.x = g * S[jt][0] + delta * k_arr[0];
+    nv.y = g * S[jt][1] + delta * k_arr[1];
+    nv.z = g * S[jt][2] + delta * k_arr[2];
+    nv.w = g * S[jt][3] + delta * k_arr[3];
     *reinterpret_cast<float4*>(ns_bh + (v_warp + jt) * K_DIM + k_lo) = nv;
-  }
 
-  // ---- out[jt] = scale * sum_k q[k] * S_new[jt,k] ----------------------
-  #pragma unroll
-  for (int jt = 0; jt < V_PER_WARP; ++jt) {
-    float local = 0.f;
-    #pragma unroll
-    for (int s = 0; s < K_LOCAL; ++s) local += q_arr[s] * S[jt][s];
-    const float o = scale * warp_reduce_sum(local);
     if (lane == jt) {
+      const float o = scale * (g * qS[jt] + delta * qk_dot);
       out_ptr[b_idx * Hv * V_DIM + h_idx * V_DIM + v_warp + jt] = __float2bfloat16(o);
     }
   }
@@ -301,6 +405,7 @@ static void init_gpu_impl() {
 
   if (g_drv.cuModuleLoadData(&g_module, ptx.data()) != 0) return;
   if (g_drv.cuModuleGetFunction(&g_kernel, g_module, "gdn_decode_kernel") != 0) return;
+  if (g_drv.cuModuleGetFunction(&g_kernel_small, g_module, "gdn_decode_kernel_small") != 0) return;
 
   g_gpu_ok = true;
 }
@@ -462,10 +567,13 @@ static void run_impl(
       (void*)&o_ptr, (void*)&ns_ptr, (void*)&scale_f
   };
 
-  const unsigned grid  = (unsigned)(B * Hv * N_V);
-  const unsigned block = (unsigned)BLOCK_THREADS;
+  const bool use_small = (B == 1);
+  const unsigned n_v_launch = use_small ? 64u : (unsigned)N_V;
+  const unsigned grid  = (unsigned)(B * Hv) * n_v_launch;
+  const unsigned block = use_small ? 64u : (unsigned)BLOCK_THREADS;
+  CUfunction kernel_fn = use_small ? g_kernel_small : g_kernel;
   CUresult lr = g_drv.cuLaunchKernel(
-      g_kernel,
+      kernel_fn,
       grid, 1, 1,
       block, 1, 1,
       0, stream, args, nullptr);
