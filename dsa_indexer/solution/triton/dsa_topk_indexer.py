@@ -10,25 +10,12 @@ import triton.language as tl
 #
 # Strategy
 # --------
-# The harness checks topk_indices elementwise with rtol=atol=1e-2 AND
-# required_matched_ratio=1.0.  To be bit-identical with the reference we
-# need to use the same op shapes the reference uses *everywhere* they can
-# affect numerics or tie-breaking:
-#   * The post-matmul `(relu * w).sum(dim=0)` must run on [H, seq_len],
-#     not [H, max_tokens] — PyTorch picks different reduction kernels.
-#   * `torch.topk` must be called per-batch on the [seq_len] scores with
-#     k = min(topk, seq_len) — torch.topk's NaN ordering depends on the
-#     input array size, and random int8 cache bytes (which include the
-#     NaN bit patterns of fp8_e4m3 and of fp32-reinterpreted scales)
-#     naturally produce NaN scores.
-#
-# What we still beat the reference on:
-#   * We dequantise only the pages referenced by block_table for live
-#     batches (the reference dequantises the entire paged cache).
-#   * The Q @ K.T matmul is batched (a single launch); verified
-#     bit-identical to per-batch at matching slice positions.
-#   * The per-batch local->global index conversion is fused into a single
-#     Triton kernel that also writes the -1 padding tail.
+# The harness checks topk_indices elementwise with required_matched_ratio=1.0.
+# To stay aligned with reference top-k tie and NaN behavior, the final
+# ReLU/weight/reduce/topk path is run per batch on exactly [H, seq_len].
+# The expensive part still avoids the reference's full-cache dequantization:
+# gather/dequantize only block_table pages, batch the Q @ K.T matmul, and fuse
+# local-to-global index conversion with -1 tail padding.
 
 
 @triton.jit
@@ -58,8 +45,6 @@ def _dequant_gather_kernel(
     out_off = out_base + p_range[:, None] * D + d_range[None, :]
 
     if token_start >= seq_len:
-        # Fill with zeros so the downstream batched matmul is well-defined.
-        # These positions are never read (we slice to :seq_len before topk).
         tl.store(OUT_ptr + out_off, tl.zeros([PS, D], dtype=tl.float32))
         return
 
@@ -74,16 +59,14 @@ def _dequant_gather_kernel(
     s_off = gp * PAGE_F32 + SCALE_F32_OFFSET + p_range
     scale = tl.load(S_ptr + s_off)
 
-    k_dq = k_fp32 * scale[:, None]
-
-    tl.store(OUT_ptr + out_off, k_dq)
+    tl.store(OUT_ptr + out_off, k_fp32 * scale[:, None])
 
 
 @triton.jit
 def _convert_indices_kernel(
-    LOC_ptr,        # int64*: [actual_topk]   per-batch topk local indices
-    BT_ptr,         # int32*: [Pmax]          per-batch block_table row
-    OUT_ptr,        # int32*: [topk]          per-batch destination row
+    LOC_ptr,        # int64*: [actual_topk] per-batch local topk indices
+    BT_ptr,         # int32*: [Pmax]        per-batch block_table row
+    OUT_ptr,        # int32*: [topk]        per-batch destination row
     actual_topk,
     topk: tl.constexpr,
     PS: tl.constexpr,
@@ -94,14 +77,11 @@ def _convert_indices_kernel(
     mask_total = offs < topk
     mask_valid = offs < actual_topk
 
-    # Read only the first `actual_topk` local indices; outside that range we
-    # skip the load (the value is gated by mask_valid below).
     loc = tl.load(LOC_ptr + offs, mask=mask_valid, other=0)
     page_slot = loc // PS
     off_in_page = loc % PS
 
-    bt_val = tl.load(BT_ptr + page_slot, mask=mask_valid, other=0)   # int32
-
+    bt_val = tl.load(BT_ptr + page_slot, mask=mask_valid, other=0)
     global_tok = bt_val.to(tl.int64) * PS + off_in_page
     result = tl.where(mask_valid, global_tok.to(tl.int32), -1)
 
@@ -110,12 +90,12 @@ def _convert_indices_kernel(
 
 @torch.no_grad()
 def run(
-    q_index_fp8,        # [B, 64, 128]          float8_e4m3fn
-    k_index_cache_fp8,  # [P, 64, 1, 132]       int8 (packed fp8+scales)
-    weights,            # [B, 64]               float32
-    seq_lens,           # [B]                   int32
-    block_table,        # [B, Pmax]             int32
-    topk_indices,       # [B, 2048]             int32  (destination buffer)
+    q_index_fp8,
+    k_index_cache_fp8,
+    weights,
+    seq_lens,
+    block_table,
+    topk_indices,
 ):
     B, H, D = q_index_fp8.shape
     P, PS, _, DSF = k_index_cache_fp8.shape
@@ -126,7 +106,6 @@ def run(
     PAGE_BYTES = PS * DSF
     PAGE_F32 = PAGE_BYTES // 4
     SCALE_F32_OFFSET = (PS * D) // 4
-
     max_tokens = Pmax * PS
 
     if B == 0:
@@ -143,7 +122,6 @@ def run(
     k_bytes = k_c.view(torch.uint8)
     k_flat_fp32 = k_bytes.reshape(-1).view(torch.float32)
 
-    # 1) Fused dequant + gather.  Only pages referenced by block_table are read.
     K_dq = torch.empty((B, max_tokens, D), dtype=torch.float32, device=device)
     _dequant_gather_kernel[(B, Pmax)](
         k_bytes, k_flat_fp32, bt_c, seq_lens, K_dq,
@@ -156,35 +134,26 @@ def run(
         num_stages=1,
     )
 
-    q_fp32 = q_c.to(torch.float32)                              # [B, H, D]
+    q_fp32 = q_c.to(torch.float32)
+    scores_hm = torch.matmul(q_fp32, K_dq.transpose(-1, -2))
 
-    # 2) Single batched matmul.  A per-batch [H, seq_len] slice of this result
-    #    is bit-identical to running the matmul for that batch independently.
-    scores_hm = torch.matmul(q_fp32, K_dq.transpose(-1, -2))    # [B, H, max_tokens]
-
-    # 3) Per-batch ReLU -> weight -> reduce-H -> topk -> global index
-    #    conversion.  Every op is on the *same* shape the reference uses,
-    #    including torch.topk on a [seq_len] 1-D tensor — critical because
-    #    torch.topk's NaN ordering depends on the input size.
     seq_lens_cpu = seq_lens.tolist()
-
     POST_BLOCK = 256
     post_grid = (triton.cdiv(topk, POST_BLOCK),)
 
     for b in range(B):
         seq_len = seq_lens_cpu[b]
         if seq_len == 0:
-            # Reference leaves the entire row as -1 (its torch.full init).
             topk_indices[b].fill_(-1)
             continue
 
-        sc = scores_hm[b, :, :seq_len]                           # [H, seq_len]
+        sc = scores_hm[b, :, :seq_len]
         sc = torch.relu(sc)
-        sc = sc * w_c[b][:, None]                                # [H, seq_len]
-        final_scores = sc.sum(dim=0)                             # [seq_len] fp32
+        sc = sc * w_c[b][:, None]
+        final_scores = sc.sum(dim=0)
 
         actual_topk = topk if seq_len > topk else seq_len
-        _, topk_local_idx = torch.topk(final_scores, actual_topk)  # [actual_topk] int64
+        _, topk_local_idx = torch.topk(final_scores, actual_topk)
 
         _convert_indices_kernel[post_grid](
             topk_local_idx, bt_c[b], topk_indices[b],

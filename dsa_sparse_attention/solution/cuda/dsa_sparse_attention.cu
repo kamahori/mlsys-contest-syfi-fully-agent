@@ -106,6 +106,19 @@ void attn_split_kernel(
   const int split = blockIdx.y;
   const int tid   = threadIdx.x;
   const int warp  = tid / 32;
+  const int k_base = split * BLOCK_N;
+
+  // Sparse indices are padded with trailing -1 entries.  The fast return is
+  // profitable for larger Nt where many CTAs are fully padded; on small-Nt
+  // tail workloads the extra prologue load/branch costs more than it saves.
+  if (gridDim.x >= 3 && sparse_idx[t * K_MAX + k_base] == -1) {
+    if (tid < H) {
+      size_t off = ((size_t)t * K_SPLITS + split) * H + tid;
+      partial_m[off] = NEG_INF;
+      partial_l[off] = 0.0f;
+    }
+    return;
+  }
 
   extern __shared__ char smem[];
   __nv_bfloat16* sQ   = reinterpret_cast<__nv_bfloat16*>(smem);
@@ -115,8 +128,6 @@ void attn_split_kernel(
   int32_t*       sIdx = reinterpret_cast<int32_t*>(sP + H * BLOCK_N_PAD);
   float*         sM   = reinterpret_cast<float*>(sIdx + BLOCK_N);
   float*         sLn  = sM + H;
-
-  const int k_base = split * BLOCK_N;
 
   // ---- Load Q (nope ‖ pe) to sQ [H, D_TOT_PAD] (padding bytes are unused) ----
   {
@@ -414,17 +425,22 @@ void attn_merge_kernel(
   }
 
   __nv_bfloat16* out_row = out + (size_t)t * H * DC + h * DC + d_base;
-  if (mg == NEG_INF || lg == 0.0f) {
-    #pragma unroll
-    for (int i = 0; i < DC_PER_MERGE_THREAD; i++) {
-      out_row[i] = __float2bfloat16(0.0f);
-    }
-  } else {
-    #pragma unroll
-    for (int i = 0; i < DC_PER_MERGE_THREAD; i++) {
-      out_row[i] = __float2bfloat16(o_acc[i] * inv_l);
-    }
+  // Unified branch: scale=0 for all-invalid → writes 0; else scale=inv_l.
+  // When mg==NEG_INF and/or lg==0, o_acc is already all-zero anyway (every
+  // per-split weight hits the w==0 `continue`), so multiplying by 0 is a no-op.
+  const float scale = (mg == NEG_INF || lg == 0.0f) ? 0.0f : inv_l;
+  // Pack 8 bf16 outputs into one 16-byte store. Using a union so the
+  // __nv_bfloat162 lanes live in the same registers as the uint4 we emit.
+  union PackedOut {
+    __nv_bfloat162 b2[DC_PER_MERGE_THREAD / 2];
+    uint4 v;
+  } packed;
+  #pragma unroll
+  for (int i = 0; i < DC_PER_MERGE_THREAD / 2; i++) {
+    packed.b2[i] = __float22bfloat162_rn(
+        make_float2(o_acc[2 * i + 0] * scale, o_acc[2 * i + 1] * scale));
   }
+  *reinterpret_cast<uint4*>(out_row) = packed.v;
 
   if (tid == 0) {
     float lse_v = (mg == NEG_INF || lg == 0.0f) ? NEG_INF
@@ -520,9 +536,11 @@ static void run_impl(
   const float sm_scale = (float)sm_scale_d;
 
   // Pick K_SPLITS based on Nt to trade per-CTA work against occupancy.
-  // Each CTA needs 2 residents/SM; H100 has 132 SMs.
-  //   Nt <= 2: 64 splits (BLOCK_N=32)  → Nt*64 blocks, covers 132 SMs @ 2/SM for Nt=1+2
-  //   else:    32 splits (BLOCK_N=64)  → Nt*32 blocks, covers for Nt >= 3
+  // B200 has 148 SMs; kernel hits 2 CTAs/SM on shared-memory budget.
+  //   Nt <= 2: 64 splits (BLOCK_N=32) → Nt*64 blocks, 32-64 SMs used.
+  //   Nt >= 3: 32 splits (BLOCK_N=64) → Nt*32 blocks, saturates for Nt>=5.
+  // (BLOCK_N=16 was tested for Nt=1 and regressed: 2x more partial-O makes
+  //  merge dominate over the split-time gain.)
   int chosen_splits;
   if (Nt <= 2) chosen_splits = 64;
   else         chosen_splits = 32;
