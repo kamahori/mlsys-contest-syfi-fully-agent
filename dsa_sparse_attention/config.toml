@@ -1,0 +1,11 @@
+[solution]
+name = "syfi-dsa-sparse-attention-v1"
+definition = "dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64"
+author = "syfi"
+
+[build]
+language = "cuda"
+entry_point = "dsa_sparse_attention.cu::run"
+target_hardware = ["cuda"]
+destination_passing_style = true
+binding = "tvm-ffi"

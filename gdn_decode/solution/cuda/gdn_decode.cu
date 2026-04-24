@@ -19,9 +19,9 @@
  * If any step fails, we fall back to a correct host-side reference
  * (slow but verified — that was the round-3 implementation).
  *
- * Kernel design (V_TILE=32, 4 warps, K-warp-reduce — proven layout):
- *   Grid:  (B * Hv * V/V_TILE) = (B * 8 * 4)
- *   Block: 128 threads = 4 warps. Each warp owns 8 v-rows; each thread holds
+ * Kernel design (V_TILE=8, 1 warp, K-warp-reduce — proven layout):
+ *   Grid:  (B * Hv * V/V_TILE) = (B * 8 * 16)
+ *   Block: 32 threads = 1 warp. Each warp owns 8 v-rows; each thread holds
  *          K_LOCAL = K/32 = 4 K-slots. State[8][4]=32 fp32 in registers.
  *   K-reductions are warp-shfl. State reads are float4-vectorized; new_state
  *   writes are float4-vectorized; output writes are scalar bf16.
@@ -93,11 +93,11 @@ static const char* KERNEL_SRC = R"CUDA(
 #define V_DIM 128
 #define Hq 4
 #define Hv 8
-#define V_TILE 32
-#define WARPS_PER_BLOCK 4
+#define V_TILE 8
+#define WARPS_PER_BLOCK 1
 #define V_PER_WARP 8
-#define N_V 4
-#define BLOCK_THREADS 128
+#define N_V 16
+#define BLOCK_THREADS 32
 #define K_LOCAL 4
 
 __device__ __forceinline__ float warp_reduce_sum(float v) {
@@ -109,7 +109,7 @@ __device__ __forceinline__ float warp_reduce_sum(float v) {
   return v;
 }
 
-extern "C" __global__ __launch_bounds__(BLOCK_THREADS, 6)
+extern "C" __global__ __launch_bounds__(BLOCK_THREADS, 12)
 void gdn_decode_kernel(
     const __nv_bfloat16* __restrict__ q_ptr,
     const __nv_bfloat16* __restrict__ k_ptr,
@@ -323,9 +323,9 @@ constexpr int K_DIM = 128;
 constexpr int V_DIM = 128;
 constexpr int Hq    = 4;
 constexpr int Hv    = 8;
-constexpr int V_TILE = 32;
-constexpr int N_V    = V_DIM / V_TILE;            // 4
-constexpr int BLOCK_THREADS = 128;
+constexpr int V_TILE = 8;
+constexpr int N_V    = V_DIM / V_TILE;            // 16
+constexpr int BLOCK_THREADS = 32;
 
 using tvm::ffi::Optional;
 using tvm::ffi::TensorView;

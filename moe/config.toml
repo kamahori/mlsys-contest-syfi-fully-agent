@@ -5,7 +5,7 @@ author = "syfi"
 
 [build]
 language = "cuda"
-entry_point = "moe.cu::run_moe"
+entry_point = "moe.cu::run"
 target_hardware = ["cuda"]
 destination_passing_style = true
 binding = "tvm-ffi"
