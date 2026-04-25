@@ -19,9 +19,12 @@ syfi-full-agent/
 ├── gdn_decode/
 │   ├── config.toml           # definition = "gdn_decode_qk4_v8_d128_k_last"
 │   └── solution/cuda/gdn_decode.cu
-└── dsa_indexer/
-    ├── config.toml           # definition = "dsa_topk_indexer_fp8_h64_d128_topk2048_ps64"
-    └── solution/cuda/dsa_topk_indexer.cu
+├── dsa_indexer/
+│   ├── config.toml           # definition = "dsa_topk_indexer_fp8_h64_d128_topk2048_ps64"
+│   └── solution/triton/dsa_topk_indexer.py
+└── dsa_sparse_attention/
+    ├── config.toml           # definition = "dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64"
+    └── solution/cuda/dsa_sparse_attention.cu
 ```
 
 ## Local testing
